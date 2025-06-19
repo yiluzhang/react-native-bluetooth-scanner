@@ -32,24 +32,32 @@ function useBluetoothScanner() {
   const [manufacturerDataMap, setManufacturerDataMap] = useState<Record<string, Device['manufacturerData']>>({});
 
   useEffect(() => {
-    const subscription = BLEScanner.addListener(device => {
-      if (device.serviceData) {
-        setServiceDataMap(prev => ({ ...prev, [device.id]: device.serviceData }));
-      }
-
-      if (device.manufacturerData) {
-        setManufacturerDataMap(prev => ({ ...prev, [device.id]: device.manufacturerData }));
-      }
-
-      setDevices(prev => {
-        const exists = prev?.some(d => d.id === device.id);
-
-        if (!exists) {
-          return [...(prev || []), device];
+    const subscription = BLEScanner.addListener((list) => {
+      for (const device of list) {
+        if (device.serviceData) {
+          setServiceDataMap((prev) => ({
+            ...prev,
+            [device.id]: device.serviceData,
+          }));
         }
 
-        return prev;
-      });
+        if (device.manufacturerData) {
+          setManufacturerDataMap((prev) => ({
+            ...prev,
+            [device.id]: device.manufacturerData,
+          }));
+        }
+
+        setDevices((prev) => {
+          const exists = prev?.some((d) => d.id === device.id);
+
+          if (!exists) {
+            return [...(prev || []), device];
+          }
+
+          return prev;
+        });
+      }
     });
 
     return () => {
@@ -62,6 +70,9 @@ function useBluetoothScanner() {
     const access = await requestPermission();
 
     if (access) {
+      setDevices(undefined);
+      setServiceDataMap({});
+      setManufacturerDataMap({});
       BLEScanner.startScan();
       setScanning(true);
     }
@@ -74,7 +85,14 @@ function useBluetoothScanner() {
     }
   };
 
-  return { scanning, devices, serviceDataMap, manufacturerDataMap, start, stop } as const;
+  return {
+    scanning,
+    devices,
+    serviceDataMap,
+    manufacturerDataMap,
+    start,
+    stop,
+  } as const;
 }
 
 const BluetoothScanScreen: React.FC = () => {
@@ -86,9 +104,9 @@ const BluetoothScanScreen: React.FC = () => {
     if (searchText) {
       const words = searchText
         .split(' ')
-        .filter(o => o.length > 0)
-        .map(o => o.toLowerCase());
-      const results = bluetoothScanner.devices?.filter(device => {
+        .filter((o) => o.length > 0)
+        .map((o) => o.toLowerCase());
+      const results = bluetoothScanner.devices?.filter((device) => {
         for (const word of words) {
           if (device.id.toLowerCase().includes(word)) {
             return true;
@@ -136,21 +154,14 @@ const BluetoothScanScreen: React.FC = () => {
 
   return (
     <View style={styles.container}>
-      <TextInput
-        style={styles.searchInput}
-        placeholder="搜索名称或地址"
-        value={searchText}
-        onChangeText={setSearchText}
-      />
+      <TextInput style={styles.searchInput} placeholder="搜索名称或地址" value={searchText} onChangeText={setSearchText} />
       <View style={styles.buttonContainer}>
         <Button
           title={bluetoothScanner.scanning ? '停止扫描' : '开始扫描'}
-          onPress={() =>
-            bluetoothScanner.scanning ? bluetoothScanner.stop() : bluetoothScanner.start()
-          }
+          onPress={() => (bluetoothScanner.scanning ? bluetoothScanner.stop() : bluetoothScanner.start())}
         />
       </View>
-      <FlatList contentContainerStyle={styles.listContainer} data={filteredScanResults} renderItem={renderItem} keyExtractor={item => item.id} />
+      <FlatList contentContainerStyle={styles.listContainer} data={filteredScanResults} renderItem={renderItem} keyExtractor={(item) => item.id} />
     </View>
   );
 };

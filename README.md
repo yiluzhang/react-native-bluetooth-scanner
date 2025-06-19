@@ -1,6 +1,7 @@
 # react-native-bluetooth-scanner
 
-一个简单的蓝牙扫描 React Native 库，Android 端使用经典蓝牙扫描，iOS 端使用 BLE 扫描。如果其他的库扫描不到你的设备，不妨试试这个。
+一个简单的蓝牙扫描 React Native 库，Android 端使用经典蓝牙扫描，iOS 端使用 BLE 扫描，每 200 毫秒向 js 端广播一次，每次最多 50 条设备信息。
+如果其他的库扫描不到你的设备，不妨试试这个。
 
 ## Installation
 
@@ -15,8 +16,8 @@ yarn add react-native-bluetooth-scanner
 import BLEScanner from 'react-native-bluetooth-scanner';
 
 // 监听扫描
-const subscription = BLEScanner.addListener((device) => {
-  console.log('Found Device:', device);
+const subscription = BLEScanner.addListener((devices) => {
+  console.log('Found Device:', devices);
 });
 
 // 开始扫描

@@ -7,8 +7,6 @@
 @property (nonatomic, strong) NSNumber *rssi;
 @property (nonatomic, strong) NSString *manufacturerData;
 @property (nonatomic, strong) NSDictionary *serviceData;
-@property (nonatomic, assign) NSTimeInterval lastSentTime;
-@property (nonatomic, strong) dispatch_block_t pendingBlock;
 @end
 
 @implementation DeviceCache
@@ -18,8 +16,9 @@
 
 @property (nonatomic, strong) CBCentralManager *centralManager;
 @property (nonatomic, assign) BOOL isScanning;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, DeviceCache *> *deviceCache;
+@property (nonatomic, strong) NSMutableArray<DeviceCache *> *deviceQueue;
 @property (nonatomic, strong) dispatch_queue_t bluetoothQueue;
+@property (nonatomic, strong) dispatch_source_t batchTimer;
 
 @end
 
@@ -29,10 +28,9 @@ RCT_EXPORT_MODULE();
 
 - (instancetype)init {
   if (self = [super init]) {
-    _bluetoothQueue = dispatch_get_main_queue(); // 或自定义 queue
+    _bluetoothQueue = dispatch_get_main_queue();
     _centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:_bluetoothQueue];
-    _deviceCache = [NSMutableDictionary dictionary];
-    _isScanning = NO;
+    _deviceQueue = [NSMutableArray array];
   }
   return self;
 }
@@ -45,6 +43,7 @@ RCT_EXPORT_METHOD(startScan) {
   if (self.centralManager.state == CBManagerStatePoweredOn && !self.isScanning) {
     self.isScanning = YES;
     [self.centralManager scanForPeripheralsWithServices:nil options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @YES}];
+    [self startBatchTimer];
   }
 }
 
@@ -52,22 +51,15 @@ RCT_EXPORT_METHOD(stopScan) {
   if (self.isScanning) {
     self.isScanning = NO;
     [self.centralManager stopScan];
-
-    // 清理 pending block
-    for (DeviceCache *cache in self.deviceCache.allValues) {
-      if (cache.pendingBlock) {
-        dispatch_block_cancel(cache.pendingBlock);
-        cache.pendingBlock = nil;
-      }
-    }
-
-    [self.deviceCache removeAllObjects];
+    [self stopBatchTimer];
+    [self.deviceQueue removeAllObjects];
   }
 }
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
   if (central.state != CBManagerStatePoweredOn) {
     self.isScanning = NO;
+    [self stopBatchTimer];
   }
 }
 
@@ -76,16 +68,8 @@ RCT_EXPORT_METHOD(stopScan) {
      advertisementData:(NSDictionary<NSString *, id> *)advertisementData
                   RSSI:(NSNumber *)RSSI {
 
-  NSString *identifier = peripheral.identifier.UUIDString;
-  NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-  DeviceCache *cache = self.deviceCache[identifier];
-  if (!cache) {
-    cache = [[DeviceCache alloc] init];
-    cache.identifier = identifier;
-    self.deviceCache[identifier] = cache;
-  }
-
-  // 更新数据
+  DeviceCache *cache = [[DeviceCache alloc] init];
+  cache.identifier = peripheral.identifier.UUIDString;
   cache.name = peripheral.name ?: @"";
   cache.rssi = RSSI;
 
@@ -104,48 +88,61 @@ RCT_EXPORT_METHOD(stopScan) {
     cache.serviceData = serviceDict;
   }
 
-  NSTimeInterval interval = now - cache.lastSentTime;
-  if (interval > 1.0) {
-    cache.lastSentTime = now;
-    [self sendDeviceEvent:cache];
-  } else {
-    if (cache.pendingBlock) {
-      dispatch_block_cancel(cache.pendingBlock);
-    }
-
-    __weak typeof(self) weakSelf = self;
-    __weak typeof(cache) weakCache = cache;
-    dispatch_block_t block = dispatch_block_create(0, ^{
-      __strong typeof(self) strongSelf = weakSelf;
-      __strong typeof(DeviceCache) *strongCache = weakCache;
-      if (!strongSelf || !strongCache) return;
-
-      strongCache.lastSentTime = [NSDate date].timeIntervalSince1970;
-      [strongSelf sendDeviceEvent:strongCache];
-      strongCache.pendingBlock = nil;
-    });
-    cache.pendingBlock = block;
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((1.0 - interval) * NSEC_PER_SEC)), self.bluetoothQueue, block);
-  }
+  [self.deviceQueue addObject:cache];
 }
 
-- (void)sendDeviceEvent:(DeviceCache *)cache {
-  NSMutableDictionary *body = [@{
-    @"id": cache.identifier,
-    @"name": cache.name ?: @"",
-    @"rssi": cache.rssi ?: @(0)
-  } mutableCopy];
+- (void)startBatchTimer {
+  if (self.batchTimer) return;
 
-  if (cache.manufacturerData) {
-    body[@"manufacturerData"] = cache.manufacturerData;
+  self.batchTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.bluetoothQueue);
+  dispatch_source_set_timer(self.batchTimer,
+                            dispatch_time(DISPATCH_TIME_NOW, 0),
+                            200 * NSEC_PER_MSEC,
+                            50 * NSEC_PER_MSEC);
+  __weak typeof(self) weakSelf = self;
+  dispatch_source_set_event_handler(self.batchTimer, ^{
+    __strong typeof(self) self = weakSelf;
+    if (!self) return;
+
+    if (self.deviceQueue.count == 0) return;
+
+    NSMutableArray *batch = [NSMutableArray array];
+    NSInteger count = 0;
+    while (self.deviceQueue.count > 0 && count < 50) {
+      DeviceCache *cache = self.deviceQueue.firstObject;
+      if (cache) {
+        NSMutableDictionary *body = [@{
+          @"id": cache.identifier,
+          @"name": cache.name ?: @"",
+          @"rssi": cache.rssi ?: @(0)
+        } mutableCopy];
+
+        if (cache.manufacturerData) {
+          body[@"manufacturerData"] = cache.manufacturerData;
+        }
+        if (cache.serviceData) {
+          body[@"serviceData"] = cache.serviceData;
+        }
+
+        [batch addObject:body];
+        [self.deviceQueue removeObjectAtIndex:0];
+        count++;
+      }
+    }
+
+    if (batch.count > 0) {
+      [self sendEventWithName:@"onBluetoothDeviceFound" body:batch];
+    }
+  });
+
+  dispatch_resume(self.batchTimer);
+}
+
+- (void)stopBatchTimer {
+  if (self.batchTimer) {
+    dispatch_source_cancel(self.batchTimer);
+    self.batchTimer = nil;
   }
-
-  if (cache.serviceData) {
-    body[@"serviceData"] = cache.serviceData;
-  }
-
-  [self sendEventWithName:@"onBluetoothDeviceFound" body:body];
 }
 
 - (NSString *)hexStringFromData:(NSData *)data {

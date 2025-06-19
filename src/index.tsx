@@ -14,7 +14,7 @@ export interface Device {
 type BluetoothScannerType = {
   startScan(): void;
   stopScan(): void;
-  addListener(listener: (event: Device) => void): EmitterSubscription;
+  addListener(listener: (devices: Device[]) => void): EmitterSubscription;
 };
 
 const emitter = new NativeEventEmitter(BluetoothScanner);

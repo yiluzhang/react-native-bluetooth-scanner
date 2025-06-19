@@ -9,151 +9,195 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 
 import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
+import androidx.core.app.ActivityCompat;
+import android.content.pm.PackageManager;
 
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.WritableNativeArray;
 import com.facebook.react.bridge.WritableNativeMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class BluetoothScannerModule extends ReactContextBaseJavaModule {
-    private final ReactApplicationContext reactContext;
-    private final BluetoothAdapter bluetoothAdapter;
-    private final Map<String, DeviceCache> deviceCache = new HashMap<>();
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+  private static final String TAG = "BluetoothScanner";
 
-    private final BroadcastReceiver receiver;
+  private final ReactApplicationContext reactContext;
+  private final BluetoothAdapter bluetoothAdapter;
+  private final Queue<DeviceCache> deviceQueue = new ConcurrentLinkedQueue<>();
+  private final Handler handler = new Handler(Looper.getMainLooper());
 
-    private static final long REPORT_INTERVAL_MS = 1000;
+  private final BroadcastReceiver receiver;
 
-    public BluetoothScannerModule(ReactApplicationContext context) {
-        super(context);
-        this.reactContext = context;
-        this.bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+  private static final long REPORT_INTERVAL_MS = 200;
+  private static final int MAX_DEVICES_PER_BATCH = 50;
 
-        this.receiver = new BroadcastReceiver() {
-            @SuppressLint("MissingPermission")
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if (BluetoothDevice.ACTION_FOUND.equals(intent.getAction())) {
-                    BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                    int rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE);
+  private boolean isScanning = false;
+  private boolean isBatching = false;
+  private boolean isReceiverRegistered = false;
 
-                    if (device != null) {
-                        String id = device.getAddress();
-                        long now = System.currentTimeMillis();
+  public BluetoothScannerModule(ReactApplicationContext context) {
+    super(context);
+    this.reactContext = context;
+    this.bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
 
-                        DeviceCache cache = deviceCache.get(id);
-                        if (cache == null) {
-                            cache = new DeviceCache();
-                            cache.id = id;
-                            deviceCache.put(id, cache);
-                        }
+    this.receiver = new BroadcastReceiver() {
+      @SuppressLint("MissingPermission")
+      @Override
+      public void onReceive(Context context, Intent intent) {
+        if (BluetoothDevice.ACTION_FOUND.equals(intent.getAction())) {
+          BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+          int rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE);
 
-                        // 更新最新数据
-                        cache.name = device.getName();
-                        cache.type = device.getType();
-                        cache.rssi = rssi;
+          if (device != null) {
+            DeviceCache cache = new DeviceCache();
+            cache.id = device.getAddress();
+            cache.name = device.getName() != null ? device.getName() : "";
+            cache.type = device.getType();
+            cache.rssi = rssi;
 
-                        long sinceLast = now - cache.lastSentTimestamp;
+            deviceQueue.offer(cache);
+          }
+        }
+      }
+    };
+  }
 
-                        if (sinceLast > REPORT_INTERVAL_MS) {
-                            cache.lastSentTimestamp = now;
-                            sendDeviceEvent(cache);
-                        } else {
-                            if (cache.pendingRunnable != null) {
-                                mainHandler.removeCallbacks(cache.pendingRunnable);
-                            }
+  @NonNull
+  @Override
+  public String getName() {
+    return "BluetoothScanner";
+  }
 
-                            final DeviceCache finalCache = cache;
-                            long delay = REPORT_INTERVAL_MS - sinceLast;
-                            cache.pendingRunnable = new Runnable() {
-                                @Override
-                                public void run() {
-                                    finalCache.lastSentTimestamp = System.currentTimeMillis();
-                                    sendDeviceEvent(finalCache);
-                                    finalCache.pendingRunnable = null;
-                                }
-                            };
-                            mainHandler.postDelayed(cache.pendingRunnable, delay);
-                        }
-                    }
-                }
-            }
-        };
+  private boolean hasRequiredPermissions() {
+    int fineLocationPermission = ContextCompat.checkSelfPermission(reactContext, android.Manifest.permission.ACCESS_FINE_LOCATION);
+    return fineLocationPermission == PackageManager.PERMISSION_GRANTED;
+  }
+
+  @SuppressLint("MissingPermission")
+  @ReactMethod
+  public void startScan() {
+    if (bluetoothAdapter == null) {
+      Log.w(TAG, "BluetoothAdapter is null");
+      return;
     }
 
-    @NonNull
+    if (!bluetoothAdapter.isEnabled()) {
+      Log.w(TAG, "Bluetooth is not enabled");
+      return;
+    }
+
+    if (!hasRequiredPermissions()) {
+      Log.w(TAG, "Missing required permissions to scan Bluetooth devices");
+      return;
+    }
+
+    if (isScanning) {
+      Log.d(TAG, "Already scanning, ignore startScan call");
+      return;
+    }
+
+    Log.d(TAG, "Start scanning");
+    isScanning = true;
+
+    if (!isReceiverRegistered) {
+      IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_FOUND);
+      reactContext.registerReceiver(receiver, filter);
+      isReceiverRegistered = true;
+    }
+
+    bluetoothAdapter.startDiscovery();
+
+    startBatchTimer();
+  }
+
+  @SuppressLint("MissingPermission")
+  @ReactMethod
+  public void stopScan() {
+    if (!isScanning) {
+      Log.d(TAG, "Not scanning, ignore stopScan call");
+      return;
+    }
+
+    Log.d(TAG, "Stop scanning");
+    isScanning = false;
+
+    if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
+      bluetoothAdapter.cancelDiscovery();
+    }
+
+    if (isReceiverRegistered) {
+      try {
+        reactContext.unregisterReceiver(receiver);
+      } catch (IllegalArgumentException ignored) {}
+      isReceiverRegistered = false;
+    }
+
+    stopBatchTimer();
+    deviceQueue.clear();
+  }
+
+  private final Runnable batchRunnable = new Runnable() {
     @Override
-    public String getName() {
-        return "BluetoothScanner";
-    }
+    public void run() {
+      if (!isScanning) return;
 
-    @SuppressLint("MissingPermission")
-    @ReactMethod
-    public void startScan() {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
-            return;
+      WritableArray deviceList = new WritableNativeArray();
+      int count = 0;
+
+      while (!deviceQueue.isEmpty() && count < MAX_DEVICES_PER_BATCH) {
+        DeviceCache cache = deviceQueue.poll();
+        if (cache != null) {
+          WritableMap map = new WritableNativeMap();
+          map.putString("id", cache.id);
+          map.putString("name", cache.name);
+          map.putInt("type", cache.type);
+          map.putInt("rssi", cache.rssi);
+          deviceList.pushMap(map);
+          count++;
         }
+      }
 
-        IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_FOUND);
-        reactContext.registerReceiver(receiver, filter);
-        bluetoothAdapter.startDiscovery();
+      if (deviceList.size() > 0) {
+        Log.d(TAG, "Send batch devices: " + deviceList.size());
+        sendEvent("onBluetoothDeviceFound", deviceList);
+      }
+
+      handler.postDelayed(this, REPORT_INTERVAL_MS);
     }
+  };
 
-    @SuppressLint("MissingPermission")
-    @ReactMethod
-    public void stopScan() {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
-            return;
-        }
+  private void startBatchTimer() {
+    if (isBatching) return;
+    isBatching = true;
+    handler.postDelayed(batchRunnable, REPORT_INTERVAL_MS);
+  }
 
-        if (bluetoothAdapter.isDiscovering()) {
-            bluetoothAdapter.cancelDiscovery();
-        }
+  private void stopBatchTimer() {
+    if (!isBatching) return;
+    isBatching = false;
+    handler.removeCallbacks(batchRunnable);
+  }
 
-        try {
-            reactContext.unregisterReceiver(receiver);
-        } catch (IllegalArgumentException e) {
-            // Already unregistered
-        }
+  private void sendEvent(String eventName, WritableArray data) {
+    reactContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+      .emit(eventName, data);
+  }
 
-        // 清理所有 pendingRunnable
-        for (DeviceCache cache : deviceCache.values()) {
-            if (cache.pendingRunnable != null) {
-                mainHandler.removeCallbacks(cache.pendingRunnable);
-            }
-        }
-        deviceCache.clear();
-    }
-
-    private void sendDeviceEvent(DeviceCache cache) {
-        WritableMap map = new WritableNativeMap();
-        map.putString("id", cache.id);
-        map.putString("name", cache.name);
-        map.putInt("type", cache.type);
-        map.putInt("rssi", cache.rssi);
-        sendEvent("onBluetoothDeviceFound", map);
-    }
-
-    private void sendEvent(String eventName, WritableMap map) {
-        reactContext
-                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                .emit(eventName, map);
-    }
-
-    private static class DeviceCache {
-        String id;
-        String name;
-        int type;
-        int rssi;
-        long lastSentTimestamp = 0;
-        Runnable pendingRunnable = null;
-    }
+  private static class DeviceCache {
+    String id;
+    String name;
+    int type;
+    int rssi;
+  }
 }
